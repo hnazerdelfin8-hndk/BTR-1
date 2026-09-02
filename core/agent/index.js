@@ -1,4 +1,4 @@
-import { getSkills, saveSkill } from '../skills/index.js';
+import { getSkills, saveSkill } from '../../skills/index.js';
 
 export async function runAgent(input) {
   const skills = getSkills();
