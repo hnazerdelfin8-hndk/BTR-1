@@ -1,72 +1,132 @@
+import { registerTool } from '../core/agent/tools.js';
+import { runAgentLoop } from '../core/agent/loop.js';
+
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const ALLOWED_TOOLS = ['weather', 'web_search', 'create_skill_definition'];
+
+registerTool('weather', {
+  description: 'Get current weather for a location.',
+  input: { query: 'string' },
+  execute: async ({ query }) => getWeather(String(query || 'Quezon City'))
+});
+
+registerTool('web_search', {
+  description: 'Search the web for current information when the user explicitly asks to search/look up/find online.',
+  input: { query: 'string' },
+  execute: async ({ query }) => webSearch(String(query || ''))
+});
+
+registerTool('create_skill_definition', {
+  description: 'Prepare a reusable natural-language custom skill definition. Never creates executable code.',
+  input: { name: 'string', description: 'string', trigger: 'string', instructions: 'string' },
+  execute: async ({ name, description, trigger, instructions }) => ({
+    ok: true,
+    skill: normalizeSkill({ name, description, trigger, instructions })
+  })
+});
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
   if (!process.env.GROQ_API_KEY) return res.status(500).json({ error: 'GROQ_API_KEY is not configured' });
 
   const { input = '', skills = [] } = req.body || {};
-  if (!input.trim()) return res.status(400).json({ error: 'Input is required' });
+  if (!String(input).trim()) return res.status(400).json({ error: 'Input is required' });
 
   try {
-    const plan = await groq({
-      model: process.env.GROQ_MODEL || 'openai/gpt-oss-20b',
-      messages: [
-        {
-          role: 'system',
-          content: `You are BTR-1, an agentic personal AI assistant. Address the user as Master.
-You can plan tasks and choose one safe action at a time. Never claim an action happened unless the server executed it.
-Available actions:
-- none: answer normally.
-- save_skill: create a reusable skill definition when Master asks BTR-1 to create, learn, add, or set up a skill.
-- weather: get current weather when explicitly requested.
-- web_search: search the web when explicitly requested.
-Custom skills are browser-local and may be used as instructions for future conversations.
-Return ONLY valid JSON with this shape:
-{"action":{"type":"none|save_skill|weather|web_search","skill":null|{"name":"","description":"","trigger":"","instructions":""},"query":""},"reply":""}
-For save_skill, make the skill practical and reusable. Do not put executable JavaScript in the skill; store natural-language instructions only.`
-        },
-        { role: 'user', content: `Master's request: ${input.trim()}\nExisting custom skills:\n${JSON.stringify(skills.slice(-30))}` }
-      ],
-      temperature: 0.1,
-      max_tokens: 900,
-      json: true
+    const request = String(input).trim();
+    const result = await runAgentLoop({
+      context: { request, skills: Array.isArray(skills) ? skills.slice(-30) : [] },
+      planStep: ({ history, tools, context }) => planNextStep({ history, tools, context })
     });
 
-    const action = normalizeAction(plan.action);
+    const finalDecision = [...result.history].reverse().find(item => item.decision?.type === 'final')?.decision;
+    const skillTool = [...result.history].reverse().find(item => item.tool === 'create_skill_definition' && item.result?.skill);
+    const action = skillTool
+      ? { type: 'save_skill', skill: skillTool.result.skill, query: '' }
+      : { type: 'none', query: '', skill: null };
 
-    if (action.type === 'save_skill') {
-      return res.status(200).json({ ok: true, action, reply: plan.reply || `I can set up ${action.skill.name} for you, Master.` });
-    }
-
-    if (action.type === 'weather') {
-      const result = await getWeather(action.query || input);
-      const reply = await summarize(input, result);
-      return res.status(200).json({ ok: true, action, data: result, reply });
-    }
-
-    if (action.type === 'web_search') {
-      const result = await webSearch(action.query || input);
-      const reply = await summarize(input, result);
-      return res.status(200).json({ ok: true, action, data: result, reply });
-    }
-
-    return res.status(200).json({ ok: true, action, reply: plan.reply || 'I understand, Master.' });
+    return res.status(200).json({
+      ok: result.ok,
+      reply: finalDecision?.reply || result.result || 'I understand, Master.',
+      action,
+      data: finalDecision?.data || null,
+      history: result.history
+    });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Agent service unavailable' });
   }
 }
 
-function normalizeAction(action = {}) {
-  const type = ['none', 'save_skill', 'weather', 'web_search'].includes(action.type) ? action.type : 'none';
+async function planNextStep({ history, tools, context }) {
+  const toolNames = tools.filter(tool => ALLOWED_TOOLS.includes(tool.name));
+  const transcript = history.map(item => {
+    if (item.decision) return { decision: item.decision };
+    return { tool: item.tool, result: item.result };
+  });
+
+  const plan = await groq({
+    model: process.env.GROQ_MODEL || 'openai/gpt-oss-20b',
+    messages: [
+      {
+        role: 'system',
+        content: `You are BTR-1, an agentic personal AI assistant. Address the user as Master.
+Work in a loop: understand the request, choose a safe allowlisted tool when needed, inspect its result, then finish.
+Never claim a tool action happened unless a tool result proves it.
+Available tools:
+${toolNames.map(tool => `- ${tool.name}: ${tool.description}`).join('\n')}
+Rules:
+- Use weather only for an explicit weather/temperature/forecast request.
+- Use web_search only when Master explicitly asks to search, look up, find online, or when current web information is necessary.
+- If Master asks you to create, learn, add, or set up a skill, use create_skill_definition first, then finish.
+- Never request arbitrary code execution, file deletion, secrets, or destructive actions.
+- If no tool is needed, finish directly.
+Return ONLY valid JSON:
+{"type":"tool","tool":"weather|web_search|create_skill_definition","input":{}} OR {"type":"final","reply":"","data":null}
+For create_skill_definition input, include name, description, trigger, and natural-language instructions only.`
+      },
+      {
+        role: 'user',
+        content: `Master's request: ${context.request}\nExisting custom skills:\n${JSON.stringify(context.skills)}\nAgent history:\n${JSON.stringify(transcript)}`
+      }
+    ],
+    temperature: 0.1,
+    max_tokens: 900,
+    json: true
+  });
+
+  return normalizeDecision(plan);
+}
+
+function normalizeDecision(decision = {}) {
+  if (decision.type === 'tool' && ALLOWED_TOOLS.includes(decision.tool)) {
+    const input = decision.input && typeof decision.input === 'object' ? decision.input : {};
+    if (decision.tool === 'create_skill_definition') {
+      return {
+        type: 'tool',
+        tool: decision.tool,
+        input: normalizeSkill(input)
+      };
+    }
+    return {
+      type: 'tool',
+      tool: decision.tool,
+      input: { query: String(input.query || '').trim() }
+    };
+  }
+
   return {
-    type,
-    query: String(action.query || '').trim(),
-    skill: type === 'save_skill' && action.skill ? {
-      name: String(action.skill.name || '').trim().slice(0, 80),
-      description: String(action.skill.description || '').trim().slice(0, 300),
-      trigger: String(action.skill.trigger || '').trim().slice(0, 300),
-      instructions: String(action.skill.instructions || '').trim().slice(0, 2000)
-    } : null
+    type: 'final',
+    reply: String(decision.reply || 'I understand, Master.'),
+    data: decision.data ?? null
+  };
+}
+
+function normalizeSkill(skill = {}) {
+  return {
+    name: String(skill.name || 'custom skill').trim().slice(0, 80),
+    description: String(skill.description || '').trim().slice(0, 300),
+    trigger: String(skill.trigger || '').trim().slice(0, 300),
+    instructions: String(skill.instructions || '').trim().slice(0, 2000)
   };
 }
 
@@ -87,18 +147,6 @@ async function groq({ model, messages, temperature, max_tokens, json = false }) 
   if (!response.ok) throw new Error(data?.error?.message || 'Groq service error');
   const content = data.choices?.[0]?.message?.content || '{}';
   return json ? JSON.parse(content) : content;
-}
-
-async function summarize(input, toolResult) {
-  return groq({
-    model: process.env.GROQ_MODEL || 'openai/gpt-oss-20b',
-    messages: [
-      { role: 'system', content: 'You are BTR-1. Give Master a concise, natural answer. Use only the supplied tool result. Never invent missing facts.' },
-      { role: 'user', content: `Request: ${input}\nTool result: ${JSON.stringify(toolResult)}` }
-    ],
-    temperature: 0.2,
-    max_tokens: 500
-  });
 }
 
 async function getWeather(query) {
