@@ -3,14 +3,22 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>BTR 1</title>
+  <title>BTR 1 — Personal AI Assistant</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 0 auto; padding: 24px; }
+    main { display: grid; gap: 16px; }
+    button { padding: 14px 18px; font-size: 16px; cursor: pointer; }
+    #status { opacity: .7; }
+    #output { min-height: 80px; padding: 16px; border: 1px solid #ccc; border-radius: 12px; white-space: pre-wrap; }
+  </style>
 </head>
 <body>
   <main>
     <h1>BTR 1</h1>
-    <p>Personal AI Assistant — foundation online.</p>
-    <button id="listen">🎙️ Listen</button>
-    <div id="status">Ready.</div>
+    <p>Personal AI Assistant</p>
+    <button id="listen">🎙️ Talk to BTR 1</button>
+    <div id="status">Ready, Master.</div>
+    <div id="output">Press the microphone and speak.</div>
   </main>
   <script type="module" src="./app.js"></script>
 </body>
