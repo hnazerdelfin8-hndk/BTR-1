@@ -9,27 +9,69 @@ export default async function handler(req, res) {
     if (tool === 'web_search') return await webSearch(req, res, query);
     return res.status(400).json({ error: `Unknown tool: ${tool}` });
   } catch (error) {
+    console.error('BTR-1 tool error:', error);
     return res.status(500).json({ error: error.message || 'Tool unavailable' });
   }
 }
 
 async function weather(req, res, query) {
-  const location = query.trim() || 'Quezon City, Philippines';
-  const url = `https://wttr.in/${encodeURIComponent(location)}?format=j1`;
-  const response = await fetch(url, { headers: { 'User-Agent': 'BTR-1/1.0' } });
-  if (!response.ok) return res.status(502).json({ error: 'Weather service unavailable' });
-  const data = await response.json();
-  const current = data.current_condition?.[0];
+  const location = extractLocation(query) || 'Quezon City, Philippines';
+
+  const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1&language=en&format=json`;
+  const geoResponse = await fetchWithTimeout(geoUrl, 8000);
+  if (!geoResponse.ok) return res.status(502).json({ error: 'Weather location service unavailable' });
+
+  const geo = await geoResponse.json();
+  const place = geo.results?.[0];
+  if (!place) return res.status(404).json({ error: `I could not find the location: ${location}` });
+
+  const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m&timezone=auto`;
+  const weatherResponse = await fetchWithTimeout(weatherUrl, 8000);
+  if (!weatherResponse.ok) return res.status(502).json({ error: 'Weather service unavailable' });
+
+  const data = await weatherResponse.json();
+  const current = data.current;
   if (!current) return res.status(502).json({ error: 'No weather data found' });
+
   return res.status(200).json({
     ok: true,
-    location,
-    temperatureC: current.temp_C,
-    feelsLikeC: current.FeelsLikeC,
-    description: current.weatherDesc?.[0]?.value || '',
-    humidity: current.humidity,
-    windKph: current.windspeedKmph
+    location: [place.name, place.admin1, place.country].filter(Boolean).join(', '),
+    temperatureC: Math.round(current.temperature_2m * 10) / 10,
+    feelsLikeC: Math.round(current.apparent_temperature * 10) / 10,
+    description: weatherDescription(current.weather_code),
+    humidity: current.relative_humidity_2m,
+    windKph: Math.round(current.wind_speed_10m * 10) / 10
   });
+}
+
+function extractLocation(input = '') {
+  const text = input.trim();
+  if (!text) return '';
+  const match = text.match(/(?:weather|temperature|forecast)(?:\s+(?:in|at|for))?\s+(.+)$/i);
+  if (match?.[1]) return match[1].replace(/[?.!]+$/, '').trim();
+  return text.replace(/^what(?:'s| is)\s+(?:the\s+)?(?:weather|temperature|forecast)\s*(?:like)?\s*/i, '').replace(/[?.!]+$/, '').trim();
+}
+
+function weatherDescription(code) {
+  const descriptions = {
+    0: 'Clear sky', 1: 'Mainly clear', 2: 'Partly cloudy', 3: 'Overcast',
+    45: 'Foggy', 48: 'Depositing rime fog', 51: 'Light drizzle', 53: 'Moderate drizzle',
+    55: 'Dense drizzle', 61: 'Slight rain', 63: 'Moderate rain', 65: 'Heavy rain',
+    71: 'Slight snow', 73: 'Moderate snow', 75: 'Heavy snow', 80: 'Slight rain showers',
+    81: 'Moderate rain showers', 82: 'Violent rain showers', 95: 'Thunderstorm',
+    96: 'Thunderstorm with slight hail', 99: 'Thunderstorm with heavy hail'
+  };
+  return descriptions[code] || 'Current conditions available';
+}
+
+async function fetchWithTimeout(url, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { signal: controller.signal, headers: { 'User-Agent': 'BTR-1/1.0' } });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function webSearch(req, res, query) {
@@ -43,12 +85,11 @@ async function webSearch(req, res, query) {
       Authorization: `Bearer ${process.env.GROQ_API_KEY}`
     },
     body: JSON.stringify({
-      model: process.env.GROQ_SEARCH_MODEL || 'compound-beta-mini',
+      model: process.env.GROQ_SEARCH_MODEL || 'groq/compound-mini',
       messages: [
-        { role: 'system', content: 'Answer the search request using available web-search capability. Clearly distinguish facts from uncertainty and keep the answer concise.' },
+        { role: 'system', content: 'Answer the search request using web search. Clearly distinguish facts from uncertainty and keep the answer concise.' },
         { role: 'user', content: query.trim() }
       ],
-      temperature: 0.2,
       max_tokens: 900
     })
   });
