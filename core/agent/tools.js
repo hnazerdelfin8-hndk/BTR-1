@@ -14,5 +14,6 @@ export function listTools() {
 export async function executeTool(name, input = {}, context = {}) {
   const tool = tools.get(name);
   if (!tool) throw new Error(`Unknown tool: ${name}`);
+  if (typeof tool.execute !== 'function') throw new Error(`Tool is not executable: ${name}`);
   return tool.execute(input, context);
 }
